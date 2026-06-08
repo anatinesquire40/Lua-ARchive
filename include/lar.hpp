@@ -1,0 +1,13 @@
+#include <vector>
+#include <unordered_map>
+#include <filesystem>
+#include <string>
+#include <sstream>
+#include <iostream>
+#include <memory>
+#include <zip.h>
+#include <lua.hpp>
+#include <LarMgr.hpp>
+#include <lAssets.hpp>
+#include <lSearcher.hpp>
+#include <lloadentry.hpp>
