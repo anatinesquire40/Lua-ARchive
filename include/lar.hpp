@@ -6,8 +6,9 @@
 #include <iostream>
 #include <memory>
 #include <zip.h>
-#include <lua.hpp>
+#include <luapp.hpp>
 #include <LarMgr.hpp>
 #include <lAssets.hpp>
 #include <lSearcher.hpp>
 #include <lloadentry.hpp>
+#include <compiler.hpp>

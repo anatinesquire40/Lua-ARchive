@@ -1,3 +1,3 @@
-LUALIB_API int luaL_loadentry(lua_State* L, MultiLar* mlar, const char* name);
-LUALIB_API int luaL_loadentry(lua_State* L, LarManager* lar, const char* name);
-LUALIB_API int lua_entrydump(lua_State* L, zip_t* archive, const char* entry, bool strip);
+bool luaL_loadentry(LuaPP::State& state, LuaPP::LTValue& out, MultiLar* mlar, const std::string& name);
+bool luaL_loadentry(LuaPP::State& state, LuaPP::LTValue& out, LarManager* lar, const std::string& name);
+bool lua_entrydump(LuaPP::State& state, const LuaPP::LTValue& func, zip_t* archive, const char* entry, bool strip);

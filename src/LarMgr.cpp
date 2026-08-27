@@ -1,19 +1,20 @@
-LarManager::LarManager(lua_State* L, const std::string& path, bool isMain) {
+LarManager::LarManager(LuaPP::State& state, const std::filesystem::path& path, bool isMain) : larpath(path) {
 	int err = 0;
-
-	archive = zip_open(path.c_str(), ZIP_RDONLY, &err);
+	auto str = larpath.string();
+	archive = zip_open(str.c_str(), ZIP_RDONLY, &err);
 	if (!archive) {
-		luaL_error(L, "Failed to open LAR file: %s (err %d)", path.c_str(), err);
+		state.error(
+			"Failed to open LAR file: " + str +
+			" (err " + std::to_string(err) + ")"
+		);
 	}
-
-	loadManifest(L, isMain);
+	loadManifest(state, isMain);
 }
 LarManager::~LarManager() {
 	if (archive) {
 		zip_close(archive);
+		archive = nullptr;
 	}
-
-	delete manifest;
 }
 zip_t* LarManager::getArchive() {
 	return archive;
@@ -42,6 +43,7 @@ std::string LarManager::readFile(const std::string& path) {
 	if (r < 0)
 		return {};
 
+	data.resize(static_cast<size_t>(r));
 	return data;
 }
 std::string LarManager::readFile(const std::string& path, size_t offset, size_t bytes) {
@@ -59,7 +61,10 @@ std::string LarManager::readFile(const std::string& path, size_t offset, size_t 
 		return {};
 	}
 
-	zip_fseek(file, offset, SEEK_SET);
+	if (zip_fseek(file, offset, SEEK_SET) != 0) {
+		zip_fclose(file);
+		return {};
+	}
 
 	size_t toRead = std::min(bytes, st.size - offset);
 
@@ -72,65 +77,136 @@ std::string LarManager::readFile(const std::string& path, size_t offset, size_t 
 
 	if (r < 0)
 		return {};
-
+	data.resize(static_cast<size_t>(r));
 	return data;
 }
 
-static void depsTableToVector(lua_State* L, int index, std::vector<std::string>& deps) {
-	size_t len = lua_rawlen(L, index);
-	for (size_t i = 1; i <= len; ++i) {
-		lua_rawgeti(L, index, i);
-		if (lua_type(L, -1) == LUA_TSTRING) {
-			deps.push_back(lua_tostring(L, -1));
+static void depsTableToVector(LuaPP::State& state, const LuaPP::LTValue& strvec, std::vector<std::string>& deps) {
+	for (auto& pair : state.ipairs(strvec)) {
+		auto& value = pair.value();
+		if (value.isstring()) {
+			deps.push_back(value.getstring());
 		}
-		lua_pop(L, 1);
 	}
 }
 
-void LarManager::loadManifest(lua_State* L, bool isMain) {
-	if (luaL_loadentry(L, this, "manifest.luac") != LUA_OK)
+void LarManager::loadManifest(LuaPP::State& state, bool isMain) {
+	auto chunk = state.mknilv();
+	if (!luaL_loadentry(state, chunk, this, "manifest.luac"))
 	{
-		luaL_error(L, "Failed to load manifest.luac: %s", lua_tostring(L, -1));
+		state.error("Failed to load manifest.luac: " + chunk.getstring());
 	}
-	lua_newtable(L);
-	lua_setupvalue(L, -2, 1); // avoid global access
-	if (lua_pcall(L, 0, 1, 0) != LUA_OK)
-	{
-		luaL_error(L, "Failed to execute manifest.luac: %s", lua_tostring(L, -1));
-	}
-	manifest = new LarManifest{};
-	int tableManifest = lua_absindex(L, -1);
-	lua_getfield(L, tableManifest, "name");
-	manifest->name = luaL_checkstring(L, -1);
-	lua_pop(L, 1);
-	lua_getfield(L, tableManifest, "version");
-	manifest->version = luaL_checkstring(L, -1);
-	manifest->disableExternalLua = false;
-	manifest->main = "";
-	manifest->deps = {};
-	manifest->manifestref = 0;
-	lua_pop(L, 1);
+	auto envnew = state.newtable();
+	state.setUpValue(chunk, 1, envnew); // avoid global access
+	LuaPP::VLTValue args;
+	auto manifestret = state.call(chunk, args, [](LuaPP::State& state, std::string msg) -> void {
+		state.error("Failed to execute manifest.luac: " + msg);
+	});
+	auto& tableManifest = state.checkindex(manifestret, 0);
+	manifest.name = state.getField(tableManifest, "name").checkstring();
+	manifest.version = state.getField(tableManifest, "version").checkstring();
+	manifest.disableExternalLua = false;
+	manifest.manifestt = state.copy(tableManifest);
 	if (isMain)
 	{
-		lua_getfield(L, tableManifest, "main");
-		manifest->main = lua_tostring(L, -1);
-		lua_pop(L, 1);
-		lua_getfield(L, tableManifest, "dependencies");
-		if (lua_istable(L, -1))
-			depsTableToVector(L, -1, manifest->deps);
-		lua_pop(L, 1);
-		lua_getfield(L, tableManifest, "disableExternalLua");
-		if (lua_isboolean(L, -1))
-			manifest->disableExternalLua = lua_toboolean(L, -1);
-		lua_pop(L, 1);
-		manifest->manifestref = luaL_ref(L, LUA_REGISTRYINDEX);
-	}
-	else
-	{
-		lua_pop(L, 1);
+		manifest.main = state.getField(tableManifest, "main").checkstring();
+		auto deps = state.getField(tableManifest, "dependencies");
+		if (deps.istable())
+			depsTableToVector(state, deps, manifest.deps);
+		manifest.disableExternalLua = state.getField(tableManifest, "disableExternalLua").getbool();
+		
 	}
 }
-
+#define classfunc(T) auto thz = state.checkindex(args, 0).checkud<T>();
+luapp_function(LarManager::getLarFileName) {
+	classfunc(LarManager)
+	return state.mkvec(state.mkvalue(thz->larpath.filename().string()));
+}
+luapp_function(LarManager::getLarFilePath) {
+	classfunc(LarManager)
+	return state.mkvec(state.mkvalue(thz->larpath.string()));
+}
+luapp_function(LarManager::getLarPath) {
+	classfunc(LarManager)
+	return state.mkvec(state.mkvalue(thz->larpath.parent_path().string()));
+}
+luapp_function(LarManager::getManifestt) {
+	classfunc(LarManager)
+	return state.mkvec(state.copy(thz->manifest.manifestt));
+}
+luapp_function(LarManager::__gc) {
+	classfunc(LarManager)
+	thz->~LarManager();
+	return {};
+}
 LarManifest* LarManager::getManifest() {
-	return manifest;
+	return &manifest;
+}
+static constexpr LuaPP::fReg lar_mtfuncs[] = {
+	{"getManifest", LarManager::getManifestt},
+	{"getLarFileName", LarManager::getLarFileName},
+	{"getLarFilePath", LarManager::getLarFilePath},
+	{"getLarPath", LarManager::getLarPath}
+};
+static constexpr LuaPP::fReg multilar_funcs[] = {
+	{"getDependencies", MultiLar::getDependencies},
+	{"getMain", MultiLar::getMain},
+	{"loadDependency", MultiLar::loadDependency}
+};
+void MultiLar::createMultiLarModule(LuaPP::State& state, const LuaPP::LTValue& obj) {
+	auto mlar_mt = state.getMetatable(obj);
+	auto __index = state.newtable();
+	state.setFuncs(multilar_funcs, __index, sizeof(multilar_funcs));
+	state.setField(mlar_mt, "__index", __index, true);
+	state.setField(mlar_mt, "__name", state.mkvalue("MultiLarInstance"), true);
+	auto package_loaded = state.getField(state.getGlobal("package"), "loaded", true);
+	state.setField(package_loaded, "MultiLar", obj, true);
+}
+
+MultiLar::MultiLar(LuaPP::State& state, const std::filesystem::path& path)
+	: main(state.mknilv()), dependencies(state.newtable()), state(state), mtlar(state.newtable()) {
+	state.setField(mtlar, "__gc", state.mkfunction(LarManager::__gc), true);
+	auto __index = state.newtable();
+	state.setFuncs(lar_mtfuncs, __index, sizeof(lar_mtfuncs));
+	state.setField(mtlar, "__index", __index, true);
+	state.setField(mtlar, "__name", state.mkvalue("LarInstance"), true);
+	LarManager* ptr = nullptr;
+	main = state.mkuserdata(ptr);
+	state.setMetatable(main, mtlar);
+	if (!ptr) state.error("out of memory: init multilar");
+	ptrmain = new (ptr) LarManager(state, path, true);
+}
+luapp_function(MultiLar::getDependencies) {
+	classfunc(MultiLar)
+	return state.mkvec(state.copy(thz->dependencies));
+}
+luapp_function(MultiLar::getMain) {
+	classfunc(MultiLar)
+	return state.mkvec(state.copy(thz->main));
+}
+extern bool findLarFile(const std::string& file, std::filesystem::path& out);
+#define ret_error(str) state.mkvec(state.mkvalue(false), state.mkvalue(str))
+#define ret_true state.mkvec(state.mkvalue(true))
+luapp_function(MultiLar::loadDependency) {
+	classfunc(MultiLar)
+	auto name = state.checkindex(args, 1).checkstring();
+	std::filesystem::path larfile;
+	if (!findLarFile(name, larfile))
+	{
+		return ret_error("dependency " + name + " not found");
+	}
+	LarManager* ptr = nullptr;
+	auto depud = state.mkuserdata(ptr);
+	if (!ptr) return ret_error("couldn't reserve dep userdata"); 
+	new (ptr) LarManager(state, larfile, false);
+	state.setMetatable(depud, thz->mtlar);
+	state.pushArrayBack(thz->dependencies, depud, true);
+	thz->lastConstructed++;
+	return ret_true;
+}
+MultiLar::~MultiLar() {
+	if (lastConstructed != INVALID_INDEX) {
+		lastConstructed = INVALID_INDEX;
+		ptrmain = nullptr;
+	}
 }

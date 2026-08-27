@@ -1,120 +1,113 @@
-#define getthz() LarAssets* thz = reinterpret_cast<LarAssets*>(lua_touserdata(L, lua_upvalueindex(1)));
-#define getasset() AssetEntry* entry = reinterpret_cast<AssetEntry*>(lua_touserdata(L, 1));
-LarAssets::LarAssets(lua_State* L, MultiLar* mlar)
-	: mlar(mlar), nextId(0)
+#define getthz() LarAssets* thz = upvals[0].getud<LarAssets>();
+#define getasset() AssetEntry* entry = state.checkindex(args, 0).checkud<AssetEntry>();
+LarAssets::LarAssets(LuaPP::State& state, MultiLar* mlar)
+	: mlar(mlar)
 {
-	luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
-	lua_newtable(L);
+	auto loaded = state.getField(state.getGlobal("package"), "loaded");
+	auto assets_lib = state.newtable();
+	auto open_func = state.mkfunction(l_open, state.mkvec(state.mkvalue(this)));
 
-	lua_pushlightuserdata(L, this);
-	lua_pushcclosure(L, LarAssets::l_open, 1);
-	lua_setfield(L, -2, "open");
-
-	lua_setfield(L, -2, "LarAssets");
-	lua_pop(L, 1);
+	state.setField(assets_lib, "open", open_func);
+	state.setField(loaded, "LarAssets", assets_lib);
+	initMetatable(state);
 }
 LarAssets::~LarAssets() {}
-AssetEntry* LarAssets::open(const std::string& fname)
+
+bool LarAssets::open(const std::string& fname, AssetEntry* asset)
 {
 	zip_t* archive = nullptr;
+	asset->path = "assets/" + fname;
 
-	std::string fullPath = "assets/" + fname;
-
-	if (!findFileInMultiLar(fullPath, mlar, &archive))
-		return nullptr;
+	if (!findFileInMultiLar(asset->path, mlar, &archive))
+		return false;
 
 	zip_stat_t st;
-	if (zip_stat(archive, fullPath.c_str(), 0, &st) != 0)
-		return nullptr;
+	if (zip_stat(archive, asset->path.c_str(), 0, &st) != 0)
+		return false;
 
-	zip_file_t* file = zip_fopen(archive, fullPath.c_str(), 0);
+	zip_file_t* file = zip_fopen(archive, asset->path.c_str(), 0);
 	if (!file)
-		return nullptr;
-
-	auto asset = std::make_unique<AssetEntry>();
-	asset->assetsIndex = nextId++;
+		return false;
 	asset->cur = 0;
 	asset->archive = archive;
 	asset->file = file;
-	asset->path = fullPath;
 	asset->size = st.size;
 
-	AssetEntry* ptr = asset.get();
-	assets[asset->assetsIndex] = std::move(asset);
-
-	return ptr;
+	return true;
 }
-static const luaL_Reg mt_funcs[] = {
+static constexpr LuaPP::fReg mt_funcs[] = {
 	{"read", LarAssets::l_read},
 	{"lines", LarAssets::l_lines},
 	{"seek", LarAssets::l_seek},
 	{"size", LarAssets::l_size},
 	{"close", LarAssets::l_close},
-	{NULL, NULL},
 };
-static void asignMetatable(lua_State* L, int udindex, LarAssets* thz)
+void LarAssets::initMetatable(LuaPP::State& state)
 {
-	int index = lua_absindex(L, udindex);
-	lua_newtable(L);
-	int metaindex = lua_gettop(L);
-	lua_newtable(L);
-	lua_pushlightuserdata(L, thz);
-	luaL_setfuncs(L, mt_funcs, 1);
-	lua_setfield(L, metaindex, "__index");
-	lua_pushstring(L, "AssetEntry");
-	lua_setfield(L, metaindex, "__name");
-	lua_setmetatable(L, index);
+	metatable = state.newtable();
+	auto __indext = state.newtable();
+	LuaPP::VLTValue upvalues_mt;
+	upvalues_mt.push_back(state.mkvalue(this));
+	state.setFuncs(mt_funcs, __indext, sizeof(mt_funcs), upvalues_mt);
+	state.setField(metatable, "__index", __indext);
+	state.setField(metatable, "__name", state.mkvalue("AssetEntry"));
 }
-int LarAssets::l_open(lua_State* L)
+luapp_function(LarAssets::l_open)
 {
+	auto ret = state.mkvec();
 	getthz()
-	std::string fname = lua_tostring(L, 1);
-	AssetEntry* asset = thz->open(fname);
-	if (!asset)
+	std::string fname = state.checkindex(args, 0).checkstring();
+	AssetEntry* asset = nullptr;
+	auto ud = state.mkuserdata(asset);
+	new (asset) AssetEntry();
+	if (!thz->open(fname, asset))
 	{
-		lua_pushnil(L);
-		lua_pushfstring(L, "Failed to open %s: entry doesn't exists", fname.c_str());
-		return 2;
+		ret.push_back(state.mknilv());
+		ret.push_back(state.mkvalue("Failed to open "+ fname + ": entry doesn't exists"));
+		return ret;
 	}
-	lua_pushlightuserdata(L, asset);
-	asignMetatable(L, -1, thz);
-	return 1;
+	state.setMetatable(ud, thz->metatable);
+	ret.push_back(std::move(ud));
+	return ret;
 }
-int LarAssets::l_read(lua_State* L)
+luapp_function(LarAssets::l_read)
 {
+#define failnil() { ret.push_back(state.mknilv()); return ret; }
+	auto ret = state.mkvec();
 	getthz()
-		getasset()
-
-		if (!entry->file)
-		{
-			lua_pushnil(L);
-			return 1;
-		}
-
-	if (lua_type(L, 2) == LUA_TNUMBER)
+	getasset()
+	auto& option = state.optindex(args, 1);
+	if (!entry->file)
 	{
-		int n = (int)lua_tointeger(L, 2);
-		if (n <= 0) return 0;
+		ret.push_back(state.mknilv());
+		return ret;
+	}
+
+	if (option.isint() || option.isnum())
+	{
+		size_t n = (size_t)option.getint();
+		if (n <= 0) failnil()
 
 		std::string buf;
 		buf.resize(n);
 
 		zip_int64_t r = zip_fread(entry->file, buf.data(), n);
 
-		if (r <= 0)
-		{
-			lua_pushnil(L);
-			return 1;
-		}
+		if (r <= 0) failnil()
 
 		entry->cur += (size_t)r;
 
-		lua_pushlstring(L, buf.data(), (size_t)r);
-		return 1;
+		buf.resize(r);
+		ret.push_back(state.mkvalue(buf));
+		return ret;
 	}
 
-	std::string mode = luaL_optstring(L, 2, "*l");
-
+	std::string mode;
+	if (option.isstring()) {
+		mode = option.getstring();
+	} else {
+		mode = "*l";
+	}
 	if (mode == "*a")
 	{
 		std::string buf;
@@ -122,16 +115,13 @@ int LarAssets::l_read(lua_State* L)
 
 		zip_int64_t r = zip_fread(entry->file, buf.data(), buf.size());
 
-		if (r <= 0)
-		{
-			lua_pushnil(L);
-			return 1;
-		}
+		if (r <= 0) failnil()
 
 		entry->cur = entry->size;
 
-		lua_pushlstring(L, buf.data(), (size_t)r);
-		return 1;
+		buf.resize(r);
+		ret.push_back(state.mkvalue(buf));
+		return ret;
 	}
 
 	if (mode == "*l" || mode == "*L")
@@ -155,38 +145,39 @@ int LarAssets::l_read(lua_State* L)
 			line.push_back(c);
 		}
 
-		if (line.empty())
-			return 0;
+		if (line.empty()) failnil()
 
-		lua_pushlstring(L, line.data(), line.size());
-		return 1;
+		ret.push_back(state.mkvalue(line));
+		return ret;
 	}
 
-	return luaL_error(L, "invalid read mode: %s", mode.c_str());
+	state.error("invalid read mode: " + mode);
+	return ret;
 }
-int LarAssets::l_size(lua_State* L)
+luapp_function(LarAssets::l_size)
 {
 	getthz()
 	getasset()
-
-	lua_pushinteger(L, (lua_Integer)thz->size(entry));
-	return 1;
+	return state.mkvec(state.mkvalue(static_cast<LuaPP::Integer>(thz->size(entry))));;
 }
 
 size_t LarAssets::size(AssetEntry* asset)
 {
 	return asset->size;
 }
-int LarAssets::l_seek(lua_State* L)
+luapp_function(LarAssets::l_seek)
 {
 	getthz()
 	getasset()
-
-	std::string mode = luaL_optstring(L, 2, "cur");
-	lua_Integer offset = luaL_optinteger(L, 3, 0);
-
-	lua_pushinteger(L, thz->seek(entry, mode, offset));
-	return 1;
+	auto& mode = state.optindex(args, 1);
+	std::string smode = "cur";
+	if (mode.isstring())
+		smode = mode.getstring();
+	auto& offset = state.optindex(args, 2);
+	size_t ioffset = 0;
+	if (offset.isint() || offset.isnum())
+		ioffset = (size_t)offset.getint();
+	return state.mkvec(state.mkvalue(static_cast<LuaPP::Integer>(thz->seek(entry, smode, ioffset))));
 }
 size_t LarAssets::seek(AssetEntry* asset, std::string& mode, size_t offset)
 {
@@ -207,16 +198,15 @@ size_t LarAssets::seek(AssetEntry* asset, std::string& mode, size_t offset)
 	return asset->cur;
 }
 
-static int lines_iter(lua_State* L)
+static luapp_function(lines_iter)
 {
 	getthz()
 
-		AssetEntry* entry =
-		(AssetEntry*)lua_touserdata(L, lua_upvalueindex(2));
+	AssetEntry* entry = upvals[1].getud<AssetEntry>();
 
 	zip_file_t* tmp = zip_fopen(entry->archive, entry->path.c_str(), 0);
 	if (!tmp)
-		return 0;
+		return {};
 
 	zip_fseek(tmp, entry->cur, SEEK_SET);
 
@@ -236,33 +226,28 @@ static int lines_iter(lua_State* L)
 	zip_fclose(tmp);
 
 	if (line.empty())
-		return 0;
-
-	lua_pushlstring(L, line.data(), line.size());
-	return 1;
+		return {};
+	return state.mkvec(state.mkvalue(line));
 }
-int LarAssets::l_lines(lua_State* L)
+luapp_function(LarAssets::l_lines)
 {
 	getthz()
 	getasset()
-
-	lua_pushlightuserdata(L, thz);
-	lua_pushlightuserdata(L, entry);
-	lua_pushcclosure(L, lines_iter, 2);
-
-	return 1;
+	return state.mkvec(state.mkfunction(lines_iter, state.mkvec(state.mkvalue(thz), state.mkvalue(entry))));
 }
-int LarAssets::l_close(lua_State* L)
+luapp_function(LarAssets::l_close)
 {
 	getthz()
 	getasset()
 	thz->close(entry);
-	return 0;
+	entry->~AssetEntry();
+	return {};
 }
-void LarAssets::close(AssetEntry* entry)
+void LarAssets::close(AssetEntry* asset)
 {
-	if (entry->file)
-		zip_fclose(entry->file);
-
-	assets.erase(entry->assetsIndex);
+	if (asset->file)
+	{
+		zip_fclose(asset->file);
+		asset->file = nullptr;
+	}
 }

@@ -4,7 +4,7 @@ constexpr char PATH_SEPARATOR = ';';
 #else
 constexpr char PATH_SEPARATOR = ':';
 #endif
-bool findLarFile(const std::string& file, std::string& out)
+bool findLarFile(const std::string& file, fs::path& out)
 {
     fs::path p(file);
 
@@ -35,235 +35,113 @@ bool findLarFile(const std::string& file, std::string& out)
 
     return false;
 }
-static bool loadDeps(lua_State* L, MultiLar* multiLar)
-{
-    LarManifest* manifest = multiLar->main->getManifest();
 
-    for (const std::string& dep : manifest->deps)
+static bool loadDeps(LuaPP::State& state, MultiLar* multiLar, std::string& errmsg)
+{
+    LarManifest* manifest = multiLar->ptrmain->getManifest();
+    auto deps_size = manifest->deps.size();
+    state.resize_table(multiLar->dependencies, static_cast<unsigned>(deps_size), 0);
+    for (size_t i = 0; i < deps_size; i++)
     {
-        std::string depFile;
+        auto next = i + 1;
+        const std::string& dep = manifest->deps[i];
+        fs::path depFile;
 
         if (!findLarFile(dep, depFile))
         {
-            lua_pushfstring(
-                L,
-                "dependency '%s' not found",
-                dep.c_str()
-            );
+            errmsg = "dependency '" + dep + "' not found";
             return false;
         }
-
-        multiLar->dependencies.emplace_back(
-            std::make_unique<LarManager>(L, depFile, false)
-        );
+        LarManager* ptr = nullptr;
+        auto depud = state.mkuserdata(ptr);
+        if (!ptr) { errmsg = "couldn't reserve dep userdata"; return false; }
+        new (ptr) LarManager(state, depFile, false);
+        state.setMetatable(depud, multiLar->mtlar);
+        state.setField(multiLar->dependencies, next, depud);
+		multiLar->lastConstructed = next;
     }
 
     return true;
 }
-static bool loadMain(lua_State* L, MultiLar* multilar, packagezSearcher* searcher) {
-	LarManager* mainLar = multilar->main.get();
+static bool loadMain(LuaPP::State& state, MultiLar* multilar, packagezSearcher* searcher, std::string& errmsg) {
+	LarManager* mainLar = multilar->ptrmain;
 	LarManifest* manifest = mainLar->getManifest();
-    if (!searcher->findFile(L, manifest->main))
+    std::string fileName;
+    if (!searcher->findFile(state, fileName, manifest->main))
     {
-        lua_pop(L, 1);
+		errmsg = fileName; // fileName contains the error message
         return false;
     }
-    std::string fileName = lua_tostring(L, -1);
-    lua_pop(L, 1);
-    if (luaL_loadentry(L, multilar->main.get(), fileName.c_str()) != LUA_OK)
+    auto chunk = state.mknilv();
+    if (!luaL_loadentry(state, chunk, mainLar, fileName))
     {
-        lua_pushfstring(L, "Failed to load main file: %s", lua_tostring(L, -1));
-        return false;
-	}
-    if (lua_pcall(L, 0, 0, 0) != LUA_OK)
-    {
-        lua_pushfstring(L, "Failed to execute main file: %s", lua_tostring(L, -1));
+        errmsg = "Failed to load main file: " + chunk.getstring();
         return false;
 	}
-    return true;
+	LuaPP::VLTValue args;
+    auto gargs = state.getGlobal("arg");
+    for (auto& pair : state.ipairs(gargs)) {
+        args.push_back(state.copy(pair.value()));
+    }
+    bool status = true;
+    state.call(chunk, args, [&errmsg, &status](LuaPP::State& state, std::string msg) -> void {
+        errmsg = "Failed to execute main file: " + state.getTraceback(msg);
+        status = false;
+    });
+    return status;
 }
 
-static int mainc(const std::vector<std::string>& args, lua_State* L)
-{
-    if (args.size() < 3) {
-        std::cerr << "[ERROR] Usage: <exe> --build <dir> -o <output>\n";
-        return 1;
+static void createargtable(const std::vector<std::string>& args, LuaPP::State& state) {
+    auto argtable = state.newtable();
+    for (size_t i = 2; i < args.size(); ++i) {
+        state.pushArrayBack(argtable, state.mkvalue(args[i]), true);
     }
-
-    std::string dirName;
-    std::string outputLar;
-    bool skipNext = false;
-    bool debugInfo = false;
-
-    for (size_t i = 2; i < args.size(); i++)
-    {
-        if (skipNext) {
-            skipNext = false;
-            continue;
-        }
-
-        const std::string& arg = args[i];
-
-        if (arg == "-o" || arg == "--output")
-        {
-            if (i + 1 >= args.size()) {
-                std::cerr << "[ERROR] Missing value after " << arg << "\n";
-                return 1;
-            }
-
-            outputLar = args[i + 1];
-            skipNext = true;
-        }
-        else if (arg == "--debug-info")
-        {
-            debugInfo = true;
-        }
-        else {
-            dirName = arg;
-        }
-    }
-
-    if (dirName.empty()) {
-        std::cerr << "[ERROR] No input directory specified\n";
-        return 1;
-    }
-
-    if (outputLar.empty()) {
-        std::cerr << "[ERROR] No output file specified\n";
-        return 1;
-    }
-
-    if (!fs::exists(dirName) || !fs::is_directory(dirName)) {
-        std::cerr << "[ERROR] Invalid input directory\n";
-        return 1;
-    }
-
-    int err = 0;
-    zip_t* za = zip_open(outputLar.c_str(), ZIP_CREATE | ZIP_TRUNCATE, &err);
-
-    if (!za) {
-        zip_error_t ze;
-        zip_error_init_with_code(&ze, err);
-        std::cerr << "[ERROR] Failed to create archive: "
-            << zip_error_strerror(&ze) << "\n";
-        zip_error_fini(&ze);
-        return 1;
-    }
-
-    for (const auto& entry : fs::recursive_directory_iterator(
-        dirName,
-        fs::directory_options::skip_permission_denied))
-    {
-        std::error_code ec;
-
-        if (!entry.is_regular_file(ec)) {
-            continue;
-        }
-
-        fs::path path = entry.path();
-        fs::path rel = fs::relative(path, dirName, ec);
-
-        if (ec) continue;
-
-        std::string relStr = rel.generic_string();
-        // =========================
-        // LUA FILE BRANCH
-        // =========================
-        if (path.extension() == ".lua")
-        {
-            if (luaL_loadfile(L, path.string().c_str()) != LUA_OK)
-            {
-                std::cerr << "[ERROR] Failed to load Lua file: " << path << "\n";
-                std::cerr << "[LUA] " << lua_tostring(L, -1) << "\n";
-                lua_pop(L, 1);
-                zip_close(za);
-                return 1;
-            }
-
-            std::string outStr = relStr + "c";
-
-            // usa tu función ya adaptada a libzip
-            lua_entrydump(L, za, outStr.c_str(), !debugInfo);
-        }
-        // =========================
-        // RAW FILE BRANCH
-        // =========================
-        else
-        {
-            if (!fs::exists(path)) {
-                continue;
-            }
-
-            zip_source_t* src =
-                zip_source_file(za, path.string().c_str(), 0, 0);
-
-            if (!src)
-            {
-                std::cerr << "[ERROR] zip_source_file failed for " << path << "\n";
-                zip_close(za);
-                return 1;
-            }
-
-            zip_int64_t idx =
-                zip_file_add(za, relStr.c_str(), src, ZIP_FL_OVERWRITE);
-
-            if (idx < 0)
-            {
-                std::cerr << "[ERROR] zip_file_add failed for " << relStr << "\n";
-                zip_source_free(src);
-                zip_close(za);
-                return 1;
-            }
-        }
-    }
-    zip_close(za);
-    lua_close(L);
-    return 0;
+    state.setGlobal("arg", argtable);
 }
-int main(int argc, char* argv[])
+extern "C" int main(int argc, char** argv)
 {
     std::vector<std::string> args(argv, argv + argc);
 
     if (argc < 2)
     {
-        std::cout << "No lar provided\n"
-            << "Usage: " << args[0] << " <lar> [args...]\n";
+        std::cout
+            << "No lar provided\n\n"
+            << "Usage:\n"
+            << "  " << args[0] << " <lar> [args...]\n"
+            << "      Run a .lar package.\n\n"
+            << "  " << args[0] << " --build <directory> -o <output.lar> [--debug-info]\n"
+            << "      Build a .lar package from a directory.\n";
         return 1;
     }
 
-    lua_State* L = luaL_newstate();
-    luaL_openlibs(L);
+    LuaPP::State state;
+    state.loadlibs();
     if (args[1] == "--build")
     {
-        return mainc(args, L);
+        return mainc(args, state);
     }
-    std::string larFile;
+    fs::path larFile;
 
     if (!findLarFile(args[1], larFile))
     {
-        return luaL_error(
-            L,
-            "error in loading %s: file not found",
-            args[1].c_str()
-        );
-    }
-
-    MultiLar multiLar{ std::make_unique<LarManager>(L, larFile, true), {} };
-    if (!loadDeps(L, &multiLar))
-    {
-        std::cerr << lua_tostring(L, -1);
-        lua_pop(L, 1);
-        lua_close(L);
+        std::cerr << "error in loading " << args[1] << ": file not found\n";
         return 1;
     }
-    packagezSearcher searcher(L, &multiLar);
-    LarAssets larAssets(L, &multiLar);
-    if (!loadMain(L, &multiLar, &searcher))
+    createargtable(args, state);
+    MultiLar* multiLar = nullptr;
+    auto mlarobj = state.mkobj(multiLar, state, larFile);
+    MultiLar::createMultiLarModule(state, mlarobj);
+    std::string errmsg;
+    if (!loadDeps(state, multiLar, errmsg))
     {
-        std::cerr << lua_tostring(L, -1);
-        lua_pop(L, 1);
+        std::cerr << errmsg;
+        return 1;
     }
-    luaL_unref(L, LUA_REGISTRYINDEX, multiLar.main->getManifest()->manifestref);
-    lua_close(L);
+    packagezSearcher searcher(state, multiLar);
+    LarAssets larAssets(state, multiLar);
+    if (!loadMain(state, multiLar, &searcher, errmsg))
+    {
+        std::cerr << errmsg;
+    }
     return 0;
 }

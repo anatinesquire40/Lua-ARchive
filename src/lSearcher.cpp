@@ -1,100 +1,63 @@
-packagezSearcher::packagezSearcher(lua_State* L, MultiLar* mlar)
+constexpr char* LUA_SEARCHERS = "searchers";
+constexpr size_t LUA_SEARCHERS_IDX = 2;
+packagezSearcher::packagezSearcher(LuaPP::State& state, MultiLar* mlar)
     : multiLar(mlar)
 {
-    LarManifest* mainManifest = multiLar->main->getManifest();
+    LarManifest* mainManifest = multiLar->ptrmain->getManifest();
 
-    lua_getglobal(L, "package");
-    luaL_checktype(L, -1, LUA_TTABLE);
+    auto package = state.getGlobal("package");
+    package.checktable();
 
-    lua_pushstring(L, "?.luac;?/init.luac");
-    lua_setfield(L, -2, "zpath");
+    state.setField(package, "zpath", state.mkvalue("?.luac;?/init.luac"));
 
-    lua_getfield(L, -1, "searchers");
-    int oldSearchers = lua_gettop(L);
-
-    lua_newtable(L);
-    int newSearchers = lua_gettop(L);
-
-    size_t len = lua_rawlen(L, oldSearchers);
-
+    auto searchers = state.getField(package, LUA_SEARCHERS);
+    auto search_func = state.mkfunction(l_search, state.mkvec(state.mkvalue(this)));
     if (mainManifest->disableExternalLua)
     {
-        lua_pushlightuserdata(L, this);
-        lua_pushcclosure(L, l_search, 1);
-        lua_rawseti(L, newSearchers, 1);
-
-        for (size_t i = 1; i <= len; i++)
-        {
-            lua_rawgeti(L, oldSearchers, i);
-            lua_rawseti(L, newSearchers, i + 1);
-        }
-    }
-    else
-    {
-        for (size_t i = 1; i <= len; i++)
-        {
-            lua_rawgeti(L, oldSearchers, i);
-            lua_rawseti(L, newSearchers, i);
-        }
-
-        lua_pushlightuserdata(L, this);
-        lua_pushcclosure(L, l_search, 1);
-        lua_rawseti(L, newSearchers, len + 1);
-    }
-
-    lua_setfield(L, -3, "searchers");
-    lua_pop(L, 2);
-    luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
-    lua_pushstring(L, "LarManifest");
-    lua_rawgeti(L, LUA_REGISTRYINDEX, mainManifest->manifestref);
-    lua_settable(L, -3);
+        state.setField(searchers, LUA_SEARCHERS_IDX, search_func, true);
+	}
+	else {
+		state.pushArrayBack(searchers, search_func, true);
+	}
 }
-std::string packagezSearcher::getPackagezPath(lua_State* L) {
-	lua_getglobal(L, "package");
-	lua_getfield(L, -1, "zpath");
-	std::string path = lua_tostring(L, -1);
-	lua_pop(L, 2);
-	return path;
+std::string packagezSearcher::getPackagezPath(LuaPP::State& state) {
+    auto package = state.getGlobal("package");
+	auto zpath = state.getField(package, "zpath");
+	return zpath.checkstring();
 }
 
-bool packagezSearcher::findFile(lua_State* L, const std::string& name)
+bool packagezSearcher::findFile(LuaPP::State& state, std::string& out, const std::string& name)
 {
-    std::string zpath = getPackagezPath(L);
+    std::string zpath = getPackagezPath(state);
     if (zpath.empty()) {
-        lua_pushstring(L, "package.zpath is not set");
+        out = "package.zpath is not set";
         return false;
     }
-    if (!searchPath(L, name, zpath, ".", "/"))
-    {
-        return false;
-    }
-    return true;
+    return searchPath(state, out, name, zpath, ".", "/");
 }
-bool packagezSearcher::search(lua_State* L, const std::string& moduleName)
+LuaPP::VLTValue packagezSearcher::search(LuaPP::State& state, const std::string& moduleName)
 {
-    if (!findFile(L, moduleName)) return false;
-	std::string foundPath = lua_tostring(L, -1);
-    lua_pop(L, 1);
-    if (luaL_loadentry(
-        L,
+    auto res = state.mkvec();
+    std::string foundPath;
+    if (!findFile(state, foundPath, moduleName)) { res.push_back(state.mkvalue(foundPath)); return res; }
+	auto chunk = state.mknilv();
+    if (!luaL_loadentry(
+        state,
+        chunk,
         multiLar,
-        foundPath.c_str()) != LUA_OK)
+        foundPath))
     {
-        luaL_error(L, "Failed to load module '%s': %s", moduleName.c_str(), lua_tostring(L, -1));
-        return false;
+        state.error("Failed to load module '" + moduleName +"': " + chunk.getstring());
+        return res;
     }
-    lua_pushstring(L, foundPath.c_str());
-    return true;
+    res.push_back(std::move(chunk));
+    res.push_back(state.mkvalue(foundPath));
+    return res;
 }
-int packagezSearcher::l_search(lua_State* L)
+luapp_function(packagezSearcher::l_search)
 {
-	packagezSearcher* thz = reinterpret_cast<packagezSearcher*>(lua_touserdata(L, lua_upvalueindex(1)));
-    std::string moduleName = luaL_checkstring(L, 1);
-    if (!thz->search(L, moduleName))
-    {
-		return 1;
-    }
-	return 2;
+	return upvals[0].getud<packagezSearcher>()->
+        search(state, state.checkindex(args, 0).checkstring());
 }
 static std::string buildNotFoundError(const std::string& path) {
     std::stringstream ss;
@@ -102,7 +65,7 @@ static std::string buildNotFoundError(const std::string& path) {
     std::size_t start = 0;
     std::size_t pos;
 
-    while ((pos = path.find(LUA_PATH_SEP, start)) != std::string::npos) {
+    while ((pos = path.find("?", start)) != std::string::npos) {
         ss << "no file '" << path.substr(start, pos - start) << "'\n\t";
         start = pos + 1;
     }
@@ -112,21 +75,25 @@ static std::string buildNotFoundError(const std::string& path) {
 }
 
 static bool readable(const std::string& filename, MultiLar* multiLar) {
-    if (multiLar->main->exists(filename)) {
+    if (multiLar->ptrmain->exists(filename)) {
         return true;
     }
-
-    for (const auto& dep : multiLar->dependencies) {
-        if (dep->exists(filename)) {
+    if (multiLar->lastConstructed == INVALID_INDEX) {
+        return false;
+    }
+    for (auto& pair : multiLar->state.ipairs(multiLar->dependencies))
+    {
+        auto it = pair.value().checkud<LarManager>();
+        if (it->exists(filename))
             return true;
-        }
     }
 
     return false;
 }
 
 bool packagezSearcher::searchPath(
-    lua_State* L,
+    LuaPP::State& state,
+    std::string& out,
     const std::string& name,
     const std::string& path,
     const std::string& sep,
@@ -145,21 +112,19 @@ bool packagezSearcher::searchPath(
     std::string searchPaths = path;
 
     size_t pos = 0;
-    while ((pos = searchPaths.find(LUA_PATH_MARK, pos)) != std::string::npos) {
+    while ((pos = searchPaths.find("?", pos)) != std::string::npos) {
         searchPaths.replace(pos, 1, moduleName);
         pos += moduleName.size();
     }
 
     std::stringstream ss(searchPaths);
     std::string candidate;
-
-    while (std::getline(ss, candidate, LUA_PATH_SEP[0])) {
+    while (std::getline(ss, candidate, ';')) {
         if (readable(candidate, multiLar)) {
-            lua_pushstring(L, candidate.c_str());
+            out = std::move(candidate);
             return true;
         }
     }
-
-    lua_pushstring(L, buildNotFoundError(searchPaths).c_str());
+    out = buildNotFoundError(searchPaths);
     return false;
 }

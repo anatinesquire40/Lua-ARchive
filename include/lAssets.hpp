@@ -1,5 +1,4 @@
 typedef struct {
-    size_t assetsIndex;
     size_t cur;
     zip_t* archive;
     zip_file_t* file;
@@ -8,27 +7,27 @@ typedef struct {
 } AssetEntry;
 class LarAssets {
 public:
-    LarAssets(lua_State* L, MultiLar* mlar);
+    LarAssets(LuaPP::State& state, MultiLar* mlar);
     ~LarAssets();
 
-    static int l_open(lua_State* L);
-    AssetEntry* open(const std::string& fname);
+	void initMetatable(LuaPP::State& state);
 
-    static int l_read(lua_State* L);
+    static luapp_function(l_open);
+    bool open(const std::string& fname, AssetEntry* asset);
 
-    static int l_lines(lua_State* L);
+    static luapp_function(l_read);
 
-    static int l_seek(lua_State* L);
+    static luapp_function(l_lines);
+
+    static luapp_function(l_seek);
     size_t seek(AssetEntry* asset, std::string& mod, size_t offset);
 
-    static int l_size(lua_State* L);
+    static luapp_function(l_size);
     size_t size(AssetEntry* asset);
 
-    static int l_close(lua_State* L);
+    static luapp_function(l_close);
     void close(AssetEntry* asset);
-
 private:
     MultiLar* mlar;
-    std::unordered_map<size_t, std::unique_ptr<AssetEntry>> assets;
-    size_t nextId;
+    LuaPP::LTValue metatable;
 };

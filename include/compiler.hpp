@@ -1,0 +1,1 @@
+int mainc(const std::vector<std::string>& args, LuaPP::State& state);
