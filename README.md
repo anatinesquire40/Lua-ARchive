@@ -43,16 +43,16 @@ Builds a `.lar` archive from a directory.
 
 # Compatibility
 
-* Lua 5.2+
+* Lua 5.3+
 * C++17+
 
 ---
 
 # Dependencies
 
-* libzip
-* zlib
-* Lua library
+* [libzip](https://libzip.org/download)
+* [zlib](https://zlib.net/)
+* [luapp](https://github.com/anatinesquire40/Lua-CPP-API)
 
 ---
 
